@@ -1,8 +1,9 @@
 #![cfg(unix)]
 
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
@@ -43,6 +44,13 @@ where
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn git_args(request: &CommandRequest) -> &[OsString] {
+    match request.args.as_slice() {
+        [option, value, args @ ..] if option == "-c" && value == "core.hooksPath=/dev/null" => args,
+        args => args,
+    }
 }
 
 struct Fixture {
@@ -152,8 +160,13 @@ impl Fixture {
                     subject: subject.clone(),
                     title: Some(format!("PR #{number}")),
                     text: "Review the pinned revision".into(),
-                    context: json!({"repository":"acme/sdk","pr":number,"base_sha":self.base,"head_sha":head,
-                        "pull":{"head_ref":format!("feature/pr-{number}")}}),
+                    context: json!({
+                        "repository": "acme/sdk",
+                        "pr": number,
+                        "base_sha": self.base,
+                        "head_sha": head,
+                        "pull": {"head_ref": format!("feature/pr-{number}")}
+                    }),
                 },
                 status: JobStatus::Preparing,
                 thread_id: None,
@@ -183,15 +196,23 @@ impl Fixture {
     }
 
     async fn app(&self) -> (App, Arc<FixtureRunner>) {
+        self.app_with_allow_hooks(false).await
+    }
+
+    async fn app_with_allow_hooks(&self, allow_hooks: bool) -> (App, Arc<FixtureRunner>) {
         let runner = Arc::new(FixtureRunner {
             origin: self.origin.clone(),
             calls: Mutex::new(Vec::new()),
         });
+        let workspace =
+            GitWorkspaces::new("acme/sdk", self.checkout.clone(), self.workspaces.clone()).unwrap();
+        let workspace = if allow_hooks {
+            workspace.with_allow_hooks(true)
+        } else {
+            workspace
+        };
         let app = App::builder()
-            .plugin(
-                GitWorkspaces::new("acme/sdk", self.checkout.clone(), self.workspaces.clone())
-                    .unwrap(),
-            )
+            .plugin(workspace)
             .plugin(FixtureCommands(runner.clone()))
             .build()
             .await
@@ -209,9 +230,11 @@ struct FixtureRunner {
 impl CommandRunner for FixtureRunner {
     async fn run(&self, mut request: CommandRequest) -> Result<CommandOutput> {
         self.calls.lock().unwrap().push(request.clone());
-        if request.program == "git" && request.args.first().is_some_and(|arg| arg == "fetch") {
-            assert_eq!(request.args.get(2).unwrap(), "origin");
-            request.args[2] = self.origin.as_os_str().to_owned();
+        let args = git_args(&request);
+        if request.program == "git" && args.first().is_some_and(|arg| arg == "fetch") {
+            assert_eq!(args.get(2).unwrap(), "origin");
+            let origin_index = request.args.len() - args.len() + 2;
+            request.args[origin_index] = self.origin.as_os_str().to_owned();
         }
         LocalCommandRunner.run(request).await
     }
@@ -273,10 +296,48 @@ async fn prepares_independent_named_pr_worktrees_at_pinned_heads_before_executio
             .lock()
             .unwrap()
             .iter()
-            .any(|call| call.args.first().is_some_and(|arg| arg == "fetch"))
+            .any(|call| git_args(call).first().is_some_and(|arg| arg == "fetch"))
     );
     app.shutdown().await.unwrap();
     assert!(first.task.session.cwd.exists());
+}
+
+#[tokio::test]
+async fn tracked_checkout_hooks_require_explicit_opt_in_without_changing_repo_configuration() {
+    for allow_hooks in [false, true] {
+        let fixture = Fixture::new();
+        let hook = fixture.author.join(".hooks/post-checkout");
+        fs::create_dir(hook.parent().unwrap()).unwrap();
+        fs::write(&hook, "#!/bin/sh\nprintf executed > ../hook-ran\n").unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        git(&fixture.author, ["add", ".hooks/post-checkout"]);
+        let head = fixture.advance(731, "PR with a tracked checkout hook\n");
+        git(&fixture.checkout, ["config", "core.hooksPath", ".hooks"]);
+        let (app, runner) = fixture.app_with_allow_hooks(allow_hooks).await;
+        let mut event = fixture.event(731, &head, None);
+
+        app.services().dispatch(&mut event).await.unwrap();
+
+        assert_eq!(fixture.workspaces.join("hook-ran").exists(), allow_hooks);
+        assert_eq!(
+            git(
+                &fixture.checkout,
+                ["config", "--local", "--get", "core.hooksPath"]
+            ),
+            ".hooks"
+        );
+        assert_eq!(git(&event.task.session.cwd, ["rev-parse", "HEAD"]), head);
+        for call in runner
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.program == "git")
+        {
+            assert_eq!(git_args(call).len() == call.args.len(), allow_hooks);
+        }
+        app.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -542,8 +603,7 @@ async fn rejects_missing_invalid_and_expanded_head_branch_names_before_workspace
     assert_eq!(git(&fixture.checkout, ["branch", "--show-current"]), "main");
     assert!(runner.calls.lock().unwrap().iter().all(|call| {
         call.program == "git"
-            && call
-                .args
+            && git_args(call)
                 .first()
                 .is_some_and(|arg| arg == "rev-parse" || arg == "check-ref-format")
     }));
@@ -740,7 +800,9 @@ async fn concurrent_local_edit_between_clean_check_and_checkout_is_never_overwri
     #[async_trait]
     impl CommandRunner for EditingRunner {
         async fn run(&self, request: CommandRequest) -> Result<CommandOutput> {
-            if request.program == "git" && request.args.first().is_some_and(|arg| arg == "reset") {
+            if request.program == "git"
+                && git_args(&request).first().is_some_and(|arg| arg == "reset")
+            {
                 fs::write(request.cwd.join("value.txt"), "concurrent user edit\n").unwrap();
             }
             self.inner.run(request).await

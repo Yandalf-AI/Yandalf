@@ -36,8 +36,9 @@ pub trait Store: Send + Sync {
     async fn record_result(&self, id: &str, result: &TurnResult) -> Result<()>;
     async fn finalizing_jobs(&self) -> Result<Vec<Job>>;
     async fn finalization_failed(&self, id: &str, error: &str) -> Result<()>;
-    /// Includes preparing, submitting, running, uncertain and finalizing jobs.
+    /// Includes preparing, submitting, running, uncertain, archiving and finalizing jobs.
     async fn inflight_count(&self) -> Result<usize>;
+    /// Includes uncertain requests and checkpointed archival that still needs reconciliation.
     async fn uncertain_jobs(&self) -> Result<Vec<Job>>;
     async fn session(&self, subject: &str) -> Result<Option<Session>>;
     async fn bind_session(&self, session: &Session) -> Result<()>;
@@ -56,6 +57,8 @@ pub trait Store: Send + Sync {
     async fn mark_submitting(&self, id: &str, thread_id: &str) -> Result<()>;
     async fn mark_running(&self, id: &str, turn_id: &str) -> Result<()>;
     async fn mark_uncertain(&self, id: &str, error: &str) -> Result<()>;
+    /// Checkpoints idempotent archival before calling the executor; cancellation must reconcile it.
+    async fn mark_archiving(&self, id: &str) -> Result<()>;
 
     /// Commits the terminal result atomically; identical retries are no-ops.
     async fn finish(

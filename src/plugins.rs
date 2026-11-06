@@ -1,4 +1,4 @@
-pub use yandalf_channels::{Schedule, Stdin};
+pub use yandalf_channels::Schedule;
 pub use yandalf_codex::CodexServer;
 pub use yandalf_core::channel::ChannelPlugin;
 pub use yandalf_core::executor::{ExecutorConnection, ExecutorProvider};

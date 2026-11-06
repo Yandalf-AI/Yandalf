@@ -9,7 +9,7 @@ Yandalf is a Rust Cargo workspace for composing agent harnesses from plugins. Th
 - `crates/yandalf-codex`: client of an external Codex app-server.
 - `crates/yandalf-sqlite`: SQLite Store provider.
 - `crates/yandalf-github`: repository input and PR-change decisions.
-- `crates/yandalf-channels`: scheduled and stdin inputs.
+- `crates/yandalf-channels`: scheduled inputs.
 - `crates/yandalf-git-workspaces`: worktree preparation and the CommandRunner capability.
 - `src/app.rs`: configuration of plugins bundled with the service; `src/main.rs`: startup and shutdown.
 - `examples/custom_harness.rs`: a complete Rust composition with a custom result observer.

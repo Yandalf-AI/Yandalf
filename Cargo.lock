@@ -1237,6 +1237,7 @@ name = "yandalf"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "futures-util",
  "serde",
  "serde_json",
@@ -1245,6 +1246,7 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "toml",
+ "tracing",
  "tracing-subscriber",
  "yandalf-channels",
  "yandalf-codex",
@@ -1264,11 +1266,9 @@ dependencies = [
  "chrono",
  "croner",
  "humantime",
- "serde",
  "serde_json",
  "tokio",
  "tokio-util",
- "tracing",
  "uuid",
  "yandalf-core",
 ]

@@ -9,22 +9,62 @@ use tokio_util::sync::CancellationToken;
 use yandalf_core::{
     decision::Decision,
     domain::{
-        Inspection, Job, JobStatus, PreparedTask, Session, SessionSpec, ThreadInspection,
-        TurnInput, TurnResult, TurnStatus,
+        Inspection, Job, JobStatus, PreparedTask, Session, SessionCreation, SessionSpec,
+        ThreadInspection, TurnInput, TurnResult, TurnStatus,
     },
     executor::Executor,
     plugin::Services,
-    store::Store,
+    store::{RunnerLease, Store},
 };
 
 pub use yandalf_core::task::{SessionPreparing, TaskCompleted, TaskDeciding, TaskPreparing};
 
-type Workers = JoinSet<(String, Result<()>)>;
+type WorkerResult = std::result::Result<(String, Result<()>), tokio::task::JoinError>;
 
-enum PreparationOutcome<T> {
+struct Workers {
+    tasks: JoinSet<(String, Result<()>)>,
+    lease: Arc<dyn RunnerLease>,
+}
+
+impl Workers {
+    fn new(lease: Box<dyn RunnerLease>) -> Self {
+        Self {
+            tasks: JoinSet::new(),
+            lease: Arc::from(lease),
+        }
+    }
+
+    fn spawn(&mut self, worker: impl Future<Output = (String, Result<()>)> + Send + 'static) {
+        let lease = self.lease.clone();
+        self.tasks.spawn(async move {
+            // Aborting the runner cannot release ownership while a worker is still being polled.
+            let _lease = lease;
+            worker.await
+        });
+    }
+
+    fn len(&self) -> usize {
+        self.tasks.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+    }
+
+    async fn join_next(&mut self) -> Option<WorkerResult> {
+        self.tasks.join_next().await
+    }
+}
+
+enum OperationOutcome<T> {
     Ready(T),
     Stopped,
     Cancelled,
+}
+
+enum PreparationRecovery {
+    Pending,
+    Ready { configured_thread: Option<String> },
 }
 
 pub struct Runtime {
@@ -40,9 +80,14 @@ impl Runtime {
         store: Arc<dyn Store>,
         executor: Arc<dyn Executor>,
     ) -> Result<Self> {
-        config.validate()?;
+        let mut config = (*config).clone();
+        if config.cwd.is_relative() {
+            config.resolve_paths(&std::env::current_dir().context("resolve harness cwd")?)?;
+        } else {
+            config.validate()?;
+        }
         Ok(Self {
-            config,
+            config: Arc::new(config),
             store,
             executor,
             services: Services::default(),
@@ -56,75 +101,13 @@ impl Runtime {
 
     pub async fn run(self: Arc<Self>, stop: CancellationToken, once: bool) -> Result<()> {
         let _shutdown = stop.clone().drop_guard();
-        let _lease = self.store.acquire_runner().await?;
-        let mut workers = Workers::new();
-        let mut active = HashSet::new();
-        for job in self.store.recover().await? {
-            self.recover_job(job, &mut workers, &mut active, stop.clone())
-                .await?;
-        }
-        let mut tick = interval(Duration::from_millis(200));
-        let mut reconcile = interval(Duration::from_secs(5));
-        let mut failure = None;
-        loop {
-            if stop.is_cancelled() {
-                break;
-            }
-            while !stop.is_cancelled()
-                && workers.len() < self.config.concurrency
-                && self.store.inflight_count().await? < self.config.concurrency
-            {
-                match self.store.claim_next().await {
-                    Ok(Some(job)) => {
-                        active.insert(job.id.clone());
-                        let runtime = self.clone();
-                        let stop = stop.clone();
-                        workers.spawn(async move {
-                            let id = job.id.clone();
-                            (id, runtime.execute(job, stop).await)
-                        });
-                    }
-                    Ok(None) => break,
-                    Err(error) => {
-                        failure = Some(error);
-                        break;
-                    }
-                }
-            }
-            if failure.is_some() || (once && workers.is_empty()) {
-                break;
-            }
-            tokio::select! {
-                _ = stop.cancelled() => break,
-                _ = tick.tick() => {},
-                _ = reconcile.tick(), if !once => {
-                    let mut recoverable = self.store.uncertain_jobs().await?;
-                    recoverable.extend(self.store.finalizing_jobs().await?);
-                    for job in recoverable {
-                        self.recover_job(job, &mut workers, &mut active, stop.clone()).await?;
-                    }
-                },
-                result = workers.join_next(), if !workers.is_empty() => {
-                    match result.unwrap() {
-                        Ok((id, result)) => {
-                            active.remove(&id);
-                            if let Err(error) = result { failure = Some(error); break; }
-                        }
-                        Err(error) => { failure = Some(error.into()); break; }
-                    }
-                },
-            }
-        }
+        let mut workers = Workers::new(self.store.acquire_runner().await?);
+        let result = self.drive(&stop, once, &mut workers).await;
         stop.cancel();
+        let mut failure = result.err();
         while let Some(result) = workers.join_next().await {
-            match result {
-                Ok((_, Ok(()))) => {}
-                Ok((_, Err(error))) => {
-                    failure.get_or_insert(error);
-                }
-                Err(error) => {
-                    failure.get_or_insert(error.into());
-                }
+            if let Err(error) = worker_result(result) {
+                failure.get_or_insert(error);
             }
         }
         if let Some(error) = failure {
@@ -143,123 +126,196 @@ impl Runtime {
         Ok(())
     }
 
-    async fn recover_job(
+    async fn drive(
+        self: &Arc<Self>,
+        stop: &CancellationToken,
+        once: bool,
+        workers: &mut Workers,
+    ) -> Result<()> {
+        let mut active = HashSet::new();
+        for job in self.store.recover().await? {
+            self.spawn_recovery(job, workers, &mut active, stop.clone());
+        }
+        let mut tick = interval(Duration::from_millis(200));
+        let mut reconcile = interval(Duration::from_secs(5));
+        loop {
+            if stop.is_cancelled() {
+                return Ok(());
+            }
+            self.claim_available(workers, &mut active, stop).await?;
+            if once && workers.is_empty() {
+                return Ok(());
+            }
+            tokio::select! {
+                _ = stop.cancelled() => return Ok(()),
+                _ = tick.tick() => {},
+                _ = reconcile.tick(), if !once => {
+                    let mut recoverable = self.store.uncertain_jobs().await?;
+                    recoverable.extend(self.store.finalizing_jobs().await?);
+                    for job in recoverable {
+                        self.spawn_recovery(job, workers, &mut active, stop.clone());
+                    }
+                },
+                result = workers.join_next(), if !workers.is_empty() => {
+                    let id = worker_result(result.context("worker set became empty")?)?;
+                    active.remove(&id);
+                },
+            }
+        }
+    }
+
+    async fn claim_available(
+        self: &Arc<Self>,
+        workers: &mut Workers,
+        active: &mut HashSet<String>,
+        stop: &CancellationToken,
+    ) -> Result<()> {
+        while !stop.is_cancelled() && workers.len() < self.config.concurrency {
+            if self.store.inflight_count().await? >= self.config.concurrency {
+                break;
+            }
+            let Some(job) = self.store.claim_next().await? else {
+                break;
+            };
+            active.insert(job.id.clone());
+            let runtime = self.clone();
+            let stop = stop.clone();
+            workers.spawn(async move {
+                let id = job.id.clone();
+                (id, runtime.execute(job, stop, None).await)
+            });
+        }
+        Ok(())
+    }
+
+    fn spawn_recovery(
         self: &Arc<Self>,
         job: Job,
         workers: &mut Workers,
         active: &mut HashSet<String>,
         stop: CancellationToken,
-    ) -> Result<()> {
-        if stop.is_cancelled() || active.contains(&job.id) {
-            return Ok(());
+    ) {
+        if stop.is_cancelled() || !active.insert(job.id.clone()) {
+            return;
         }
+        let runtime = self.clone();
+        workers.spawn(async move {
+            let id = job.id.clone();
+            (id, runtime.reconcile(job, stop).await)
+        });
+    }
+
+    async fn reconcile(&self, job: Job, stop: CancellationToken) -> Result<()> {
         if job.status == JobStatus::Finalizing {
-            active.insert(job.id.clone());
-            let runtime = self.clone();
-            workers.spawn(async move {
-                let result = runtime.finalize(&job, stop).await;
-                (job.id, result)
-            });
-            return Ok(());
+            return self.finalize(&job, stop).await;
+        }
+        if job.status == JobStatus::Archiving {
+            return self.archive(&job, &stop, true).await;
         }
         let Some(thread_id) = &job.thread_id else {
-            if self
-                .store
-                .session_creation(&job.event.subject)
-                .await?
-                .is_some()
-                || self.store.session(&job.event.subject).await?.is_some()
+            if let PreparationRecovery::Ready { configured_thread } =
+                self.reconcile_preparation(&job, &stop).await?
             {
                 self.store.resume_preparation(&job.id).await?;
-                active.insert(job.id.clone());
-                let runtime = self.clone();
-                workers.spawn(async move {
-                    let id = job.id.clone();
-                    (id, runtime.execute(job, stop).await)
-                });
-            } else {
+                self.execute(job, stop, configured_thread).await?;
+            }
+            return Ok(());
+        };
+        let Some(inspection) = self
+            .reconciliation_request(
+                &job,
+                &stop,
+                "executor turn inspection",
+                self.executor
+                    .inspect(thread_id, &job.id, job.turn_id.as_deref()),
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+        match inspection {
+            Inspection::Finished { turn_id, result } => {
+                self.store.mark_running(&job.id, &turn_id).await?;
+                self.complete(&job, &result, stop).await?;
+            }
+            Inspection::Active { turn_id } => {
+                self.store.mark_running(&job.id, &turn_id).await?;
+                self.monitor(&job, &turn_id, stop).await?;
+            }
+            Inspection::Missing => {
+                self.store
+                    .mark_uncertain(
+                        &job.id,
+                        "no confirmed executor turn; automatic resubmission is unsafe",
+                    )
+                    .await?;
+            }
+            Inspection::Ambiguous { reason } => {
+                self.store.mark_uncertain(&job.id, &reason).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn reconcile_preparation(
+        &self,
+        job: &Job,
+        stop: &CancellationToken,
+    ) -> Result<PreparationRecovery> {
+        let existing = self.store.session(&job.event.subject).await?;
+        let mut configured_thread = None;
+        if existing.is_none() {
+            let Some(creation) = self.store.session_creation(&job.event.subject).await? else {
                 self.store
                     .mark_uncertain(
                         &job.id,
                         "session creation has no persisted intent or binding",
                     )
                     .await?;
+                return Ok(PreparationRecovery::Pending);
+            };
+            if self.identify_creation(job, stop, creation).await?.is_none() {
+                return Ok(PreparationRecovery::Pending);
             }
-            return Ok(());
-        };
-        match self
-            .executor
-            .inspect(thread_id, &job.id, job.turn_id.as_deref())
-            .await
-        {
-            Ok(Inspection::Finished { turn_id, result }) => {
-                self.store.mark_running(&job.id, &turn_id).await?;
-                self.store.record_result(&job.id, &result).await?;
-                active.insert(job.id.clone());
-                let runtime = self.clone();
-                workers.spawn(async move {
-                    let result = runtime.finalize(&job, stop).await;
-                    (job.id, result)
-                });
+        } else if let Some(prepared) = self.store.job_preparation(&job.id).await? {
+            let session = existing.context("session disappeared")?;
+            if self
+                .reconciliation_request(
+                    job,
+                    stop,
+                    "session configuration",
+                    self.executor
+                        .configure_thread(&session.thread_id, &prepared.session),
+                )
+                .await?
+                .is_none()
+            {
+                return Ok(PreparationRecovery::Pending);
             }
-            Ok(Inspection::Active { turn_id }) => {
-                self.store.mark_running(&job.id, &turn_id).await?;
-                active.insert(job.id.clone());
-                let runtime = self.clone();
-                workers.spawn(async move {
-                    let result = runtime.monitor(&job, &turn_id, stop).await;
-                    (job.id, result)
-                });
-            }
-            Ok(Inspection::Missing) => {
-                self.store
-                    .mark_uncertain(
-                        &job.id,
-                        "no confirmed executor turn; automatic resubmission is unsafe",
-                    )
-                    .await?
-            }
-            Ok(Inspection::Ambiguous { reason }) => {
-                self.store.mark_uncertain(&job.id, &reason).await?
-            }
-            Err(error) => {
-                self.store
-                    .mark_uncertain(&job.id, &format!("cannot inspect executor turn: {error:#}"))
-                    .await?
-            }
+            configured_thread = Some(session.thread_id);
         }
-        Ok(())
+        if stop.is_cancelled() {
+            return Ok(PreparationRecovery::Pending);
+        }
+        Ok(PreparationRecovery::Ready { configured_thread })
     }
 
-    async fn execute(&self, job: Job, stop: CancellationToken) -> Result<()> {
+    async fn execute(
+        &self,
+        job: Job,
+        stop: CancellationToken,
+        configured_thread: Option<String>,
+    ) -> Result<()> {
         tracing::info!(job_id = %job.id, subject = %job.event.subject, "job started");
         if self.stop_before_submission(&job, &stop).await? {
             return Ok(());
         }
-        let mut decision = TaskDeciding {
-            job: job.clone(),
-            decision: Decision::Run,
-        };
-        let Some(result) = self
-            .before_submission(&job, &stop, self.services.dispatch(&mut decision))
-            .await?
-        else {
+        let Some(decision) = self.decide(&job, &stop).await? else {
             return Ok(());
         };
-        if let Err(error) = result {
-            self.store
-                .finish(
-                    &job.id,
-                    JobStatus::Failed,
-                    None,
-                    Some(&format!("decision: {error:#}")),
-                )
-                .await?;
-            return Ok(());
-        }
-        match decision.decision {
+        match decision {
             Decision::Run => {}
-            Decision::Archive => return self.archive(&job, &stop).await,
+            Decision::Archive => return self.archive(&job, &stop, false).await,
             Decision::Skip { reason } => {
                 self.store
                     .finish(&job.id, JobStatus::Skipped, None, Some(&reason))
@@ -268,71 +324,130 @@ impl Runtime {
                 return Ok(());
             }
         }
-        let prepared = if let Some(prepared) = self.store.job_preparation(&job.id).await? {
-            prepared
+        let Some(prepared) = self.prepare_task(&job, &stop).await? else {
+            return Ok(());
+        };
+        let thread_id = if let Some(thread_id) = configured_thread {
+            thread_id
         } else {
-            if self.stop_before_submission(&job, &stop).await? {
-                return Ok(());
-            }
-            let mut existing = self.store.session(&job.event.subject).await?;
-            if let Some(session) = &mut existing {
-                match self.executor.thread_cwd(&session.thread_id).await {
-                    Ok(cwd) => session.cwd = cwd,
-                    Err(error) => {
-                        self.store
-                            .mark_uncertain(
-                                &job.id,
-                                &format!("cannot inspect session cwd: {error:#}"),
-                            )
-                            .await?;
-                        return Ok(());
-                    }
-                }
-            }
-            let mut preparation = TaskPreparing {
-                job: job.clone(),
-                task: PreparedTask {
-                    session: SessionSpec {
-                        cwd: existing
-                            .as_ref()
-                            .map_or_else(|| self.config.cwd.clone(), |session| session.cwd.clone()),
-                        title: job.event.title.clone(),
-                        git: None,
-                    },
-                    input: TurnInput {
-                        text: job.event.text.clone(),
-                        context: job.event.context.clone(),
-                    },
-                },
-                existing_session: existing,
-            };
-            let Some(result) = self
-                .before_submission(&job, &stop, self.prepare(&mut preparation))
-                .await?
+            let Some(thread_id) = self.prepare_session(&job, &prepared.session, &stop).await?
             else {
                 return Ok(());
             };
-            if let Err(error) = result {
-                self.store
-                    .finish(
-                        &job.id,
-                        JobStatus::Failed,
-                        None,
-                        Some(&format!("preparation: {error:#}")),
-                    )
-                    .await?;
-                return Ok(());
-            }
-            self.store
-                .save_preparation(&job.id, &preparation.task)
-                .await?;
-            preparation.task
+            thread_id
         };
-        if self.stop_before_submission(&job, &stop).await? {
-            return Ok(());
+        self.submit(job, thread_id, &prepared.input, stop).await
+    }
+
+    async fn decide(&self, job: &Job, stop: &CancellationToken) -> Result<Option<Decision>> {
+        let mut decision = TaskDeciding {
+            job: job.clone(),
+            decision: Decision::Run,
+        };
+        let Some(result) = self
+            .before_submission(job, stop, self.services.dispatch(&mut decision))
+            .await?
+        else {
+            return Ok(None);
+        };
+        if let Err(error) = result {
+            self.fail_before_submission(job, "decision", &error).await?;
+            return Ok(None);
         }
-        let thread_id = match self.session(&job, &prepared.session).await {
-            Ok(id) => id,
+        Ok(Some(decision.decision))
+    }
+
+    async fn prepare_task(
+        &self,
+        job: &Job,
+        stop: &CancellationToken,
+    ) -> Result<Option<PreparedTask>> {
+        if let Some(prepared) = self.store.job_preparation(&job.id).await? {
+            return Ok(Some(prepared));
+        }
+        if self.stop_before_submission(job, stop).await? {
+            return Ok(None);
+        }
+        let mut existing = self.store.session(&job.event.subject).await?;
+        if let Some(session) = &mut existing {
+            let Some(result) = self
+                .before_submission(job, stop, self.executor.thread_cwd(&session.thread_id))
+                .await?
+            else {
+                return Ok(None);
+            };
+            match result {
+                Ok(cwd) => session.cwd = cwd,
+                Err(error) => {
+                    self.store
+                        .mark_uncertain(&job.id, &format!("cannot inspect session cwd: {error:#}"))
+                        .await?;
+                    return Ok(None);
+                }
+            }
+        }
+        let mut preparation = TaskPreparing {
+            job: job.clone(),
+            task: PreparedTask {
+                session: SessionSpec {
+                    cwd: existing
+                        .as_ref()
+                        .map_or_else(|| self.config.cwd.clone(), |session| session.cwd.clone()),
+                    title: job.event.title.clone(),
+                    git: None,
+                },
+                input: TurnInput {
+                    text: job.event.text.clone(),
+                    context: job.event.context.clone(),
+                },
+            },
+            existing_session: existing,
+        };
+        let Some(result) = self
+            .before_submission(job, stop, self.prepare(&mut preparation))
+            .await?
+        else {
+            return Ok(None);
+        };
+        if let Err(error) = result {
+            self.fail_before_submission(job, "preparation", &error)
+                .await?;
+            return Ok(None);
+        }
+        self.store
+            .save_preparation(&job.id, &preparation.task)
+            .await?;
+        Ok(Some(preparation.task))
+    }
+
+    async fn fail_before_submission(
+        &self,
+        job: &Job,
+        phase: &str,
+        error: &anyhow::Error,
+    ) -> Result<()> {
+        self.store
+            .finish(
+                &job.id,
+                JobStatus::Failed,
+                None,
+                Some(&format!("{phase}: {error:#}")),
+            )
+            .await
+    }
+
+    async fn prepare_session(
+        &self,
+        job: &Job,
+        spec: &SessionSpec,
+        stop: &CancellationToken,
+    ) -> Result<Option<String>> {
+        if self.stop_before_submission(job, stop).await? {
+            return Ok(None);
+        }
+        let thread_id = match self.session(job, spec, stop).await {
+            Ok(Some(thread_id)) => thread_id,
+            Ok(None) => return Ok(None),
             Err(error) => {
                 self.store
                     .mark_uncertain(
@@ -340,110 +455,167 @@ impl Runtime {
                         &format!("session creation requires reconciliation: {error:#}"),
                     )
                     .await?;
-                return Ok(());
+                return Ok(None);
             }
         };
-        if self.stop_before_submission(&job, &stop).await? {
-            return Ok(());
+        if self.stop_before_submission(job, stop).await? {
+            return Ok(None);
         }
-        if let Err(error) = self
-            .executor
-            .configure_thread(&thread_id, &prepared.session)
-            .await
+        if self
+            .lifecycle_request(
+                job,
+                stop,
+                "session configuration",
+                self.executor.configure_thread(&thread_id, spec),
+            )
+            .await?
+            .is_none()
         {
-            self.store
-                .mark_uncertain(&job.id, &format!("session configuration: {error:#}"))
-                .await?;
-            return Ok(());
+            return Ok(None);
         }
+        self.store.resume_preparation(&job.id).await?;
+        Ok(Some(thread_id))
+    }
+
+    async fn submit(
+        &self,
+        mut job: Job,
+        thread_id: String,
+        input: &TurnInput,
+        stop: CancellationToken,
+    ) -> Result<()> {
         if self.stop_before_submission(&job, &stop).await? {
             return Ok(());
         }
         self.store.mark_submitting(&job.id, &thread_id).await?;
-        match self
-            .executor
-            .start_turn(&thread_id, &job.id, &prepared.input)
-            .await
-        {
-            Ok(turn_id) => {
-                self.store.mark_running(&job.id, &turn_id).await?;
-                let mut job = job;
-                job.thread_id = Some(thread_id);
-                self.monitor(&job, &turn_id, stop).await
-            }
-            Err(error) => {
-                self.store
-                    .mark_uncertain(
-                        &job.id,
-                        &format!("submission acknowledgement lost or rejected: {error:#}"),
-                    )
-                    .await?;
-                tracing::warn!(job_id = %job.id, "job needs reconciliation");
-                Ok(())
-            }
-        }
+        let Some(turn_id) = self
+            .lifecycle_request(
+                &job,
+                &stop,
+                "turn submission",
+                self.executor.start_turn(&thread_id, &job.id, input),
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+        self.store.mark_running(&job.id, &turn_id).await?;
+        job.thread_id = Some(thread_id);
+        self.monitor(&job, &turn_id, stop).await
     }
 
-    async fn archive(&self, job: &Job, stop: &CancellationToken) -> Result<()> {
-        if self.stop_before_submission(job, stop).await? {
+    async fn archive(&self, job: &Job, stop: &CancellationToken, reconciling: bool) -> Result<()> {
+        if stop.is_cancelled() || (!reconciling && self.stop_before_submission(job, stop).await?) {
             return Ok(());
         }
+        self.store.mark_archiving(&job.id).await?;
         let session = match self.store.session(&job.event.subject).await? {
             Some(session) => Some(session),
             None => {
                 if let Some(creation) = self.store.session_creation(&job.event.subject).await? {
-                    let Some(outcome) = self
-                        .before_submission(job, stop, self.executor.inspect_thread(&creation.id))
-                        .await?
-                    else {
-                        return Ok(());
-                    };
-                    let identified = outcome.and_then(|inspection| match inspection {
-                        ThreadInspection::Found { thread_id } => Ok(thread_id),
-                        ThreadInspection::Missing => {
-                            bail!("no confirmed thread for persisted creation intent")
-                        }
-                        ThreadInspection::Ambiguous { reason } => bail!("{reason}"),
-                    });
-                    let thread_id = match identified {
-                        Ok(thread_id) => thread_id,
-                        Err(error) => {
-                            self.store
-                                .mark_uncertain(&job.id, &format!("session archival: {error:#}"))
-                                .await?;
-                            return Ok(());
-                        }
-                    };
-                    let session = Session {
-                        subject: creation.subject,
-                        cwd: creation.cwd,
-                        thread_id,
-                    };
-                    self.store.bind_session(&session).await?;
-                    Some(session)
+                    self.identify_creation(job, stop, creation).await?
                 } else {
                     None
                 }
             }
         };
         if let Some(session) = session {
-            let Some(outcome) = self
-                .before_submission(job, stop, self.executor.archive_thread(&session.thread_id))
+            let archived = if reconciling {
+                self.reconciliation_request(
+                    job,
+                    stop,
+                    "session archival",
+                    self.executor.archive_thread(&session.thread_id),
+                )
                 .await?
-            else {
-                return Ok(());
+            } else {
+                self.lifecycle_request(
+                    job,
+                    stop,
+                    "session archival",
+                    self.executor.archive_thread(&session.thread_id),
+                )
+                .await?
             };
-            if let Err(error) = outcome {
-                self.store
-                    .mark_uncertain(&job.id, &format!("session archival: {error:#}"))
-                    .await?;
+            if archived.is_none() {
                 return Ok(());
             }
             tracing::info!(job_id = %job.id, thread_id = %session.thread_id, "session archived");
+        } else if self
+            .store
+            .session_creation(&job.event.subject)
+            .await?
+            .is_some()
+        {
+            return Ok(());
         }
-        self.store
-            .finish(&job.id, JobStatus::Succeeded, None, None)
-            .await
+        let status = if self.store.get_job(&job.id).await?.cancel_requested {
+            JobStatus::Cancelled
+        } else {
+            JobStatus::Succeeded
+        };
+        self.store.finish(&job.id, status, None, None).await
+    }
+
+    async fn identify_creation(
+        &self,
+        job: &Job,
+        stop: &CancellationToken,
+        creation: SessionCreation,
+    ) -> Result<Option<Session>> {
+        let Some(inspection) = self
+            .reconciliation_request(
+                job,
+                stop,
+                "session creation inspection",
+                self.executor.inspect_thread(&creation.id),
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let thread_id = match inspection {
+            ThreadInspection::Found { thread_id } => thread_id,
+            ThreadInspection::Missing => {
+                self.store
+                    .mark_uncertain(&job.id, "no confirmed thread for persisted creation intent")
+                    .await?;
+                return Ok(None);
+            }
+            ThreadInspection::Ambiguous { reason } => {
+                self.store.mark_uncertain(&job.id, &reason).await?;
+                return Ok(None);
+            }
+        };
+        let session = Session {
+            subject: creation.subject,
+            cwd: creation.cwd,
+            thread_id,
+        };
+        self.store.bind_session(&session).await?;
+        Ok(Some(session))
+    }
+
+    async fn wait_operation<T: Send>(
+        &self,
+        job: &Job,
+        stop: &CancellationToken,
+        operation: impl Future<Output = T> + Send,
+    ) -> Result<OperationOutcome<T>> {
+        tokio::pin!(operation);
+        let mut cancel_poll = interval(Duration::from_millis(200));
+        loop {
+            tokio::select! {
+                biased;
+                _ = stop.cancelled() => return Ok(OperationOutcome::Stopped),
+                _ = cancel_poll.tick() => {
+                    if self.store.get_job(&job.id).await?.cancel_requested {
+                        return Ok(OperationOutcome::Cancelled);
+                    }
+                }
+                result = &mut operation => return Ok(OperationOutcome::Ready(result)),
+            }
+        }
     }
 
     async fn before_submission<T: Send>(
@@ -452,32 +624,60 @@ impl Runtime {
         stop: &CancellationToken,
         operation: impl Future<Output = T> + Send,
     ) -> Result<Option<T>> {
-        let outcome = {
-            let operation = operation;
-            tokio::pin!(operation);
-            let mut cancel_poll = interval(Duration::from_millis(200));
-            loop {
-                tokio::select! {
-                    _ = stop.cancelled() => break PreparationOutcome::Stopped,
-                    result = &mut operation => break PreparationOutcome::Ready(result),
-                    _ = cancel_poll.tick() => {
-                        if self.store.get_job(&job.id).await?.cancel_requested {
-                            break PreparationOutcome::Cancelled;
-                        }
-                    }
-                }
-            }
-        };
-        match outcome {
-            PreparationOutcome::Ready(result) => Ok(Some(result)),
-            PreparationOutcome::Stopped => Ok(None),
-            PreparationOutcome::Cancelled => {
+        match self.wait_operation(job, stop, operation).await? {
+            OperationOutcome::Ready(result) => Ok(Some(result)),
+            OperationOutcome::Stopped => Ok(None),
+            OperationOutcome::Cancelled => {
                 self.store
                     .finish(&job.id, JobStatus::Cancelled, None, None)
                     .await?;
                 Ok(None)
             }
         }
+    }
+
+    async fn lifecycle_request<T: Send>(
+        &self,
+        job: &Job,
+        stop: &CancellationToken,
+        phase: &str,
+        operation: impl Future<Output = Result<T>> + Send,
+    ) -> Result<Option<T>> {
+        // A dropped executor request may still complete after its caller stops waiting.
+        self.store
+            .mark_uncertain(&job.id, &format!("{phase} request in progress"))
+            .await?;
+        let error = match self.wait_operation(job, stop, operation).await? {
+            OperationOutcome::Ready(Ok(result)) => return Ok(Some(result)),
+            OperationOutcome::Ready(Err(error)) => format!("{phase}: {error:#}"),
+            OperationOutcome::Stopped => format!("{phase}: shutdown before outcome was confirmed"),
+            OperationOutcome::Cancelled => {
+                format!("{phase}: cancellation before outcome was confirmed")
+            }
+        };
+        self.store.mark_uncertain(&job.id, &error).await?;
+        tracing::warn!(job_id = %job.id, error, "executor request needs reconciliation");
+        Ok(None)
+    }
+
+    async fn reconciliation_request<T: Send>(
+        &self,
+        job: &Job,
+        stop: &CancellationToken,
+        phase: &str,
+        operation: impl Future<Output = Result<T>> + Send,
+    ) -> Result<Option<T>> {
+        let error = tokio::select! {
+            biased;
+            _ = stop.cancelled() => format!("{phase}: shutdown before outcome was confirmed"),
+            result = operation => match result {
+                Ok(result) => return Ok(Some(result)),
+                Err(error) => format!("{phase}: {error:#}"),
+            },
+        };
+        self.store.mark_uncertain(&job.id, &error).await?;
+        tracing::warn!(job_id = %job.id, error, "executor reconciliation remains incomplete");
+        Ok(None)
     }
 
     async fn stop_before_submission(&self, job: &Job, stop: &CancellationToken) -> Result<bool> {
@@ -523,9 +723,14 @@ impl Runtime {
         Ok(())
     }
 
-    async fn session(&self, job: &Job, spec: &SessionSpec) -> Result<String> {
+    async fn session(
+        &self,
+        job: &Job,
+        spec: &SessionSpec,
+        stop: &CancellationToken,
+    ) -> Result<Option<String>> {
         if let Some(session) = self.store.session(&job.event.subject).await? {
-            return Ok(session.thread_id);
+            return Ok(Some(session.thread_id));
         }
         let (creation, fresh) = self
             .store
@@ -536,11 +741,31 @@ impl Runtime {
             "creation intent differs from prepared cwd"
         );
         let id = if fresh {
-            self.executor
-                .create_thread(&creation.cwd, &creation.id)
+            let Some(id) = self
+                .lifecycle_request(
+                    job,
+                    stop,
+                    "session creation",
+                    self.executor.create_thread(&creation.cwd, &creation.id),
+                )
                 .await?
+            else {
+                return Ok(None);
+            };
+            id
         } else {
-            match self.executor.inspect_thread(&creation.id).await? {
+            let Some(inspection) = self
+                .reconciliation_request(
+                    job,
+                    stop,
+                    "session creation inspection",
+                    self.executor.inspect_thread(&creation.id),
+                )
+                .await?
+            else {
+                return Ok(None);
+            };
+            match inspection {
                 ThreadInspection::Found { thread_id } => thread_id,
                 ThreadInspection::Missing => bail!(
                     "no confirmed thread for persisted creation intent; automatic creation retry is unsafe"
@@ -555,7 +780,10 @@ impl Runtime {
                 thread_id: id.clone(),
             })
             .await?;
-        Ok(id)
+        if fresh {
+            self.store.resume_preparation(&job.id).await?;
+        }
+        Ok(Some(id))
     }
 
     async fn monitor(&self, job: &Job, turn_id: &str, stop: CancellationToken) -> Result<()> {
@@ -567,36 +795,78 @@ impl Runtime {
         let mut cancel_poll = interval(Duration::from_millis(200));
         let reason = loop {
             tokio::select! {
-                result = &mut wait => {
-                    match result {
-                        Ok(result) => self.complete(job, &result, stop).await?,
-                        Err(error) => self.store.mark_uncertain(&job.id, &format!("lost executor result: {error:#}")).await?,
-                    }
-                    return Ok(());
-                },
+                result = &mut wait => return self.receive_result(job, result, stop).await,
                 _ = stop.cancelled() => return Ok(()),
                 _ = &mut deadline => break "execution timeout",
                 _ = cancel_poll.tick() => {
-                    if self.store.get_job(&job.id).await?.cancel_requested { break "cancellation requested"; }
+                    if self.store.get_job(&job.id).await?.cancel_requested {
+                        break "cancellation requested";
+                    }
                 }
             }
         };
+        self.interrupt_turn(job, turn_id, &mut wait, stop, reason)
+            .await
+    }
+
+    async fn receive_result(
+        &self,
+        job: &Job,
+        result: Result<TurnResult>,
+        stop: CancellationToken,
+    ) -> Result<()> {
+        match result {
+            Ok(result) => self.complete(job, &result, stop).await,
+            Err(error) => {
+                self.store
+                    .mark_uncertain(&job.id, &format!("lost executor result: {error:#}"))
+                    .await
+            }
+        }
+    }
+
+    async fn interrupt_turn(
+        &self,
+        job: &Job,
+        turn_id: &str,
+        wait: &mut (impl Future<Output = Result<TurnResult>> + Unpin),
+        stop: CancellationToken,
+        reason: &str,
+    ) -> Result<()> {
+        let thread = job.thread_id.as_deref().context("missing thread id")?;
         self.store.request_cancel(&job.id).await?;
-        if let Err(error) = self.executor.interrupt(thread, turn_id).await {
+        let interrupted = tokio::select! {
+            biased;
+            _ = stop.cancelled() => return Ok(()),
+            result = &mut *wait => return self.receive_result(job, result, stop).await,
+            result = timeout(Duration::from_secs(10), self.executor.interrupt(thread, turn_id)) => {
+                result.context("interrupt acknowledgement timed out").and_then(|result| result)
+            },
+        };
+        if let Err(error) = interrupted {
             self.store
                 .mark_uncertain(&job.id, &format!("{reason}; interrupt failed: {error:#}"))
                 .await?;
             return Ok(());
         }
-        match timeout(Duration::from_secs(10), &mut wait).await {
-            Ok(Ok(result)) => self.complete(job, &result, stop).await?,
-            _ => {
+        let result = tokio::select! {
+            biased;
+            _ = stop.cancelled() => return Ok(()),
+            result = timeout(Duration::from_secs(10), wait) => {
+                result.context("terminal state acknowledgement timed out").and_then(|result| result)
+            },
+        };
+        match result {
+            Ok(result) => self.complete(job, &result, stop).await,
+            Err(error) => {
                 self.store
-                    .mark_uncertain(&job.id, &format!("{reason}; terminal state not confirmed"))
-                    .await?
+                    .mark_uncertain(
+                        &job.id,
+                        &format!("{reason}; terminal state not confirmed: {error:#}"),
+                    )
+                    .await
             }
         }
-        Ok(())
     }
 
     async fn complete(
@@ -644,7 +914,9 @@ impl Runtime {
                     _ = stop.cancelled() => return Ok(()),
                     result = &mut observers => break Some(result),
                     _ = cancel_poll.tick() => {
-                        if self.store.get_job(&job.id).await?.cancel_requested { break None; }
+                        if self.store.get_job(&job.id).await?.cancel_requested {
+                            break None;
+                        }
                     }
                 }
             }
@@ -656,7 +928,7 @@ impl Runtime {
             self.store
                 .finalization_failed(&job.id, &format!("completion processing: {error:#}"))
                 .await?;
-            tracing::warn!(job_id = %job.id, error = %error, "saved result awaits completion processing");
+            tracing::warn!(job_id = %job.id, error = %format!("{error:#}"), "saved result awaits completion processing");
             return Ok(());
         }
         let (status, error) = match result.status {
@@ -670,4 +942,10 @@ impl Runtime {
         tracing::info!(job_id = %job.id, "job finished");
         Ok(())
     }
+}
+
+fn worker_result(result: WorkerResult) -> Result<String> {
+    let (id, result) = result.context("task worker failed")?;
+    result.with_context(|| format!("job {id}"))?;
+    Ok(id)
 }

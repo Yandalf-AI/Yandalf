@@ -59,7 +59,7 @@ async fn serve(config: Arc<Config>, services: Services, stop: CancellationToken)
                 }
             }
             Err(error) => {
-                tracing::warn!(error = %error, "executor connection failed; inbox remains active")
+                tracing::warn!(error = %format!("{error:#}"), "executor connection failed; inbox remains active")
             }
         }
         tokio::select! {

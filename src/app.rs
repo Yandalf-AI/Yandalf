@@ -2,7 +2,7 @@ use crate::{
     codex::CodexConfig,
     config::Config,
     github::{ChangeKind, Github},
-    input::{Schedule, Stdin},
+    input::Schedule,
     plugin::App,
     plugins::{CodexServer, TaskRunner},
     workspace::{GitWorkspaces, LocalCommands},
@@ -47,6 +47,8 @@ pub enum PluginConfig {
         repository: String,
         checkout: PathBuf,
         root: PathBuf,
+        #[serde(default)]
+        allow_hooks: bool,
     },
     Github {
         repository: String,
@@ -68,7 +70,6 @@ pub enum PluginConfig {
         #[serde(default)]
         context: Value,
     },
-    Stdin,
 }
 fn rpc_timeout() -> u64 {
     30
@@ -152,8 +153,12 @@ impl Settings {
                     repository,
                     checkout,
                     root,
+                    allow_hooks,
                 } => {
-                    app = app.plugin(GitWorkspaces::new(&repository, checkout, root)?);
+                    app = app.plugin(
+                        GitWorkspaces::new(&repository, checkout, root)?
+                            .with_allow_hooks(allow_hooks),
+                    );
                     continue;
                 }
                 PluginConfig::Github {
@@ -185,10 +190,6 @@ impl Settings {
                         "duplicate input configuration"
                     );
                     app = app.plugin(input);
-                }
-                PluginConfig::Stdin => {
-                    ensure!(sources.insert("stdin".into()), "duplicate stdin input");
-                    app = app.plugin(Stdin);
                 }
             };
         }

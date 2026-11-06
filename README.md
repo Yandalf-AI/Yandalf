@@ -11,7 +11,7 @@ Plugins are ordinary Cargo dependencies. A custom plugin needs `yandalf-core`; s
 - `yandalf-codex`: client of an independently running Codex app-server.
 - `yandalf-sqlite`: the SQLite implementation of `Store`.
 - `yandalf-github`: repository polling and configurable PR-change decisions.
-- `yandalf-channels`: scheduled and stdin inputs.
+- `yandalf-channels`: scheduled inputs.
 - `yandalf-git-workspaces`: Git worktree preparation and the replaceable `CommandRunner` capability.
 
 ```rust
@@ -107,7 +107,9 @@ Replace the sample endpoint and repository paths with those of your executor hos
 
 The Codex client accepts explicit `unix://`, `ws://` or `wss://` endpoints. Unix sockets carry the same WebSocket protocol. Optional `bearer_token_env` names the environment variable containing a remote listener's token. Models, approvals, authentication, home directories and native memory belong to the server configuration. Interactive approval requests that remain after server policy are declined by the headless client.
 
-A `schedule` input accepts `text`, optional `context`, and exactly one of `interval` or five-field `cron` in UTC. Interval schedules begin immediately; cron schedules begin at the next matching time. Missed schedule ticks remain eligible after restart. The `stdin` plugin accepts JSON lines containing `id`, `subject`, `text`, and optional `title` and `context`.
+A `schedule` input accepts `text`, optional `context`, and exactly one of `interval` or five-field `cron` in UTC. Interval schedules begin immediately; cron schedules begin at the next matching time. Missed schedule ticks remain eligible after restart.
+
+One application can run multiple inputs concurrently: configure each GitHub repository or schedule as another `[[plugins]]` entry. All inputs persist events into the same inbox while the runtime limits execution. Custom inputs implement `Channel` and register through `ChannelPlugin`; their transport can be stdin, a socket, a queue or another event source. The [custom harness example](examples/custom_harness.rs) shows independent inputs sharing one runtime.
 
 ## GitHub review workflow
 
@@ -118,6 +120,10 @@ Closing or merging a tracked PR queues session archival after its current work f
 Observations and skip reasons survive restarts. Repository-wide comment feeds detect edits independently of PR timestamps. Stack membership supplies dependency context and never limits the watched PRs. Polling cannot reconstruct intermediate pushes between observations.
 
 `GitWorkspaces` uses the configured command provider before a session or turn is started. For a new PR it creates `root/pr-N`, checks out the observed head SHA using the PR's source branch name, and records ownership so interrupted preparation can safely reuse the directory. A conflicting local branch is preserved; the worktree uses `review/pr-N` instead. Existing owned review branches are renamed in place. Existing sessions retain their actual linked worktrees, including detached checkouts. Revision changes require a clean worktree and never alter the primary checkout or a foreign branch. `CommandRunner` must operate on the executor's host; `LocalCommands` is suitable when harness and executor share that host.
+
+Workspace preparation disables Git hooks by default. Set `allow_hooks = true` in a `git_workspaces` plugin entry, or call `GitWorkspaces::with_allow_hooks(true)`, to permit the checkout's configured hooks. Those hooks execute on the command provider's host and may come from the PR itself. This setting affects workspace preparation; the agent server controls commands executed by its tools.
+
+On Unix, SQLite creates new store directories with mode `0700` and database and lock files with mode `0600`. Opening an existing Yandalf database also restricts its database and journal files; unrelated parent directories keep their permissions.
 
 The prepared cwd, title and Git metadata are applied through the executor interface. The agent receives the PR identity, revisions, change reasons and stack context, and performs the review through its native tools. It does not prepare or change the checkout. The bundled [github-review skill](skills/github-review/SKILL.md) defines review evidence and concise Russian publication through `gh`.
 

@@ -114,8 +114,12 @@ Completion observers have at-least-once semantics. When one fails, all can be re
 
 For a custom input, implement `Channel::run(inbox, stop)` and register it through ChannelPlugin, or register the same service dependency and task directly. Only acknowledge after `Inbox::accept` succeeds. Derive stable delivery IDs and subjects from the source entity.
 
+Register multiple ChannelPlugin instances to run independent inputs in one application. They share the durable inbox; a busy executor must not block admission. Event IDs are scoped by source, while matching subjects share a session across sources. For blocking input such as stdin, bridge a dedicated reader thread into a bounded async channel; a blocked `tokio::io::stdin()` read can prevent Tokio runtime shutdown. The custom harness example uses two application mailboxes as transport boundaries.
+
 For an agent backend, implement Executor for session creation, configuration, turn execution, inspection and interruption. ExecutorProvider supplies a connection plus a future reporting closure. Match the selected checkout's interface and establish what the remote API can recover before claiming idempotent creation or submission.
 
 For a database, implement every Store operation with its documented atomicity, read-after-write consistency and exclusive runner ownership. In-flight mutations must settle before a dropped caller releases execution ownership. Use SQLite's failure/recovery tests as behavioral examples; SQL and connections stay inside the storage provider.
+
+Archiving records an idempotent lifecycle intent before the executor call. Keep it in recovery and subject reservations until its outcome is confirmed, including after cancellation; it is not a model turn or an ordinary skipped job.
 
 The current runner does not automatically retire a binding to a deleted backend session. An explicitly requested reset needs a deliberate lifecycle policy; an unavailable or unloaded session alone is not evidence that a new one should be created.

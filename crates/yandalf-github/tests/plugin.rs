@@ -12,7 +12,17 @@ fn event(id: &str, head: &str, state: &str, draft: bool) -> Event {
         subject: "github:owner/repo/pr/1".into(),
         title: Some("PR #1".into()),
         text: "Review".into(),
-        context: json!({"base_sha":"a".repeat(40),"head_sha":head,"pull":{"state":state,"draft":draft,"head_ref":"feature"},"changes":[{"kind":"revision"}],"viewer":"bot"}),
+        context: json!({
+            "base_sha": "a".repeat(40),
+            "head_sha": head,
+            "pull": {
+                "state": state,
+                "draft": draft,
+                "head_ref": "feature"
+            },
+            "changes": [{"kind": "revision"}],
+            "viewer": "bot"
+        }),
     }
 }
 

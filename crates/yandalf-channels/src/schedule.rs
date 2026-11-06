@@ -141,7 +141,10 @@ impl yandalf_core::channel::Channel for Schedule {
         let mut tick = inbox.source_cursor(self.source(), initial).await?;
         loop {
             let wait = tick.saturating_sub(now_ms()).max(0) as u64;
-            tokio::select! {_=stop.cancelled()=>return Ok(()),_=tokio::time::sleep(std::time::Duration::from_millis(wait.min(60_000)))=>{}}
+            tokio::select! {
+                _ = stop.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(wait.min(60_000))) => {}
+            }
             if tick > now_ms() {
                 continue;
             }

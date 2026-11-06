@@ -569,7 +569,7 @@ async fn unconfirmed_archive_retries_after_restart_and_preserves_the_binding() {
         .is_err()
     );
     let pending = store.get_job(&close.id).await.unwrap();
-    assert_eq!(pending.status, JobStatus::Uncertain);
+    assert_eq!(pending.status, JobStatus::Archiving);
     assert!(pending.thread_id.is_none());
     assert_eq!(store.inflight_count().await.unwrap(), 1);
 
@@ -665,7 +665,7 @@ async fn closure_with_an_unresolved_creation_intent_keeps_its_execution_slot_aft
         );
         assert_eq!(
             store.get_job(&close.id).await.unwrap().status,
-            JobStatus::Uncertain
+            JobStatus::Archiving
         );
         assert_eq!(
             store.get_job(&next.id).await.unwrap().status,
