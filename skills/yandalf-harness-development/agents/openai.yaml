@@ -1,0 +1,4 @@
+interface:
+  display_name: "Yandalf Harness Development"
+  short_description: "Build Rust harnesses and plugins with Yandalf"
+  default_prompt: "Use $yandalf-harness-development to build or extend a Rust harness with Yandalf crates."

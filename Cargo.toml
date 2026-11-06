@@ -1,0 +1,81 @@
+[workspace]
+members = ["crates/*"]
+default-members = [".", "crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+publish = false
+
+[workspace.dependencies]
+yandalf-core = { path = "crates/yandalf-core" }
+yandalf-runtime = { path = "crates/yandalf-runtime" }
+yandalf-codex = { path = "crates/yandalf-codex" }
+yandalf-sqlite = { path = "crates/yandalf-sqlite" }
+yandalf-github = { path = "crates/yandalf-github" }
+yandalf-channels = { path = "crates/yandalf-channels" }
+yandalf-git-workspaces = { path = "crates/yandalf-git-workspaces" }
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+croner = { version = "4.0", default-features = false, features = ["chrono"] }
+humantime = "2.4"
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }
+rusqlite = { version = "0.41", default-features = false, features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.54", default-features = false }
+tokio-util = { version = "0.7", default-features = false }
+toml = "1.1"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+uuid = { version = "1.0", features = ["v4", "v5"] }
+tempfile = "3.0"
+
+[package]
+name = "yandalf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+default = ["sqlite"]
+sqlite = ["dep:yandalf-sqlite"]
+
+[[bin]]
+name = "yandalf"
+path = "src/main.rs"
+required-features = ["sqlite"]
+
+[[example]]
+name = "custom_harness"
+required-features = ["sqlite"]
+
+[dependencies]
+yandalf-core.workspace = true
+yandalf-runtime.workspace = true
+yandalf-codex.workspace = true
+yandalf-sqlite = { workspace = true, optional = true }
+yandalf-github.workspace = true
+yandalf-channels.workspace = true
+yandalf-git-workspaces.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+tokio-util.workspace = true
+toml.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+futures-util.workspace = true
+tokio-tungstenite.workspace = true
+tempfile.workspace = true
+
+[profile.release]
+lto = "thin"
+strip = true

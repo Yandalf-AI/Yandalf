@@ -1,0 +1,22 @@
+[package]
+name = "yandalf-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+yandalf-core.workspace = true
+anyhow.workspace = true
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+yandalf-sqlite.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
