@@ -1,11 +1,11 @@
 use crate::{
     codex::CodexConfig,
     config::Config,
-    github::{ChangeKind, Github},
+    github::{ChangeKind, Github, WorktreeConfig},
     input::Schedule,
     plugin::App,
     plugins::{CodexServer, TaskRunner},
-    workspace::{GitWorkspaces, LocalCommands},
+    worktree::{GitWorktree, LocalCommands},
 };
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
@@ -43,15 +43,14 @@ pub enum PluginConfig {
         timeout_secs: u64,
     },
     LocalCommands,
-    GitWorkspaces {
-        repository: String,
-        checkout: PathBuf,
-        root: PathBuf,
+    GitWorktree {
         #[serde(default)]
         allow_hooks: bool,
     },
     Github {
         repository: String,
+        #[serde(default)]
+        worktree: Option<WorktreeConfig>,
         #[serde(default)]
         text: Option<String>,
         #[serde(default = "ChangeKind::defaults")]
@@ -97,9 +96,12 @@ impl Settings {
                 #[cfg(feature = "sqlite")]
                 PluginConfig::Sqlite { path } => resolve(path, base),
                 PluginConfig::Runtime { cwd, .. } => resolve(cwd, base),
-                PluginConfig::GitWorkspaces { checkout, root, .. } => {
-                    resolve(checkout, base);
-                    resolve(root, base);
+                PluginConfig::Github {
+                    worktree: Some(worktree),
+                    ..
+                } => {
+                    resolve(&mut worktree.checkout, base);
+                    resolve(&mut worktree.root, base);
                 }
                 _ => {}
             }
@@ -149,28 +151,24 @@ impl Settings {
                     app = app.plugin(LocalCommands);
                     continue;
                 }
-                PluginConfig::GitWorkspaces {
-                    repository,
-                    checkout,
-                    root,
-                    allow_hooks,
-                } => {
-                    app = app.plugin(
-                        GitWorkspaces::new(&repository, checkout, root)?
-                            .with_allow_hooks(allow_hooks),
-                    );
+                PluginConfig::GitWorktree { allow_hooks } => {
+                    app = app.plugin(GitWorktree::default().with_allow_hooks(allow_hooks));
                     continue;
                 }
                 PluginConfig::Github {
                     repository,
+                    worktree,
                     text,
                     on,
                     interval,
                     cron,
                 } => {
-                    let input = Github::new(&repository, interval.as_deref(), cron.as_deref())?
+                    let mut input = Github::new(&repository, interval.as_deref(), cron.as_deref())?
                         .with_instruction(text.as_deref())?
                         .with_triggers(on);
+                    if let Some(worktree) = worktree {
+                        input = input.with_worktree(worktree)?;
+                    }
                     ensure!(
                         sources.insert(input.source().to_owned()),
                         "duplicate input configuration"

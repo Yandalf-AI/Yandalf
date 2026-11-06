@@ -7,14 +7,13 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use tokio::{process::Command, sync::Mutex, time::timeout};
 
 use yandalf_core::{
     domain::GitInfo,
     plugin::{Plugin, PluginContext},
-    task::TaskPreparing,
 };
 
 #[derive(Clone, Debug)]
@@ -40,10 +39,10 @@ impl CommandOutput {
     fn text(self) -> Result<String> {
         ensure!(
             self.success(),
-            "workspace command failed: {}",
+            "worktree command failed: {}",
             String::from_utf8_lossy(&self.stderr).trim()
         );
-        String::from_utf8(self.stdout).context("workspace command returned non-UTF-8 data")
+        String::from_utf8(self.stdout).context("worktree command returned non-UTF-8 data")
     }
 }
 
@@ -75,14 +74,14 @@ impl CommandRunner for LocalCommandRunner {
         .await
         .with_context(|| {
             format!(
-                "workspace command {:?} timed out in {}",
+                "worktree command {:?} timed out in {}",
                 request.program,
                 request.cwd.display()
             )
         })?
         .with_context(|| {
             format!(
-                "start workspace command {:?} in {}",
+                "start worktree command {:?} in {}",
                 request.program,
                 request.cwd.display()
             )
@@ -107,158 +106,128 @@ impl Plugin for LocalCommands {
     }
 }
 
-#[derive(Clone)]
-pub struct GitWorkspaces {
-    name: String,
-    repository: String,
-    checkout: PathBuf,
-    root: PathBuf,
+#[derive(Clone, Default)]
+pub struct GitWorktree {
     allow_hooks: bool,
-    lock: Arc<Mutex<()>>,
 }
 
-impl GitWorkspaces {
-    pub fn new(repository: &str, checkout: PathBuf, root: PathBuf) -> Result<Self> {
-        let repository = canonical_repository(repository)?;
-        for path in [&checkout, &root] {
-            ensure!(path.is_absolute(), "Git workspace paths must be absolute");
-            ensure!(
-                !path
-                    .components()
-                    .any(|component| matches!(component, Component::ParentDir)),
-                "Git workspace paths must not contain parent traversal"
-            );
-        }
-        Ok(Self {
-            name: format!("workspaces.git:{repository}"),
-            repository,
-            checkout,
-            root,
-            allow_hooks: false,
-            lock: Arc::new(Mutex::new(())),
-        })
-    }
-
+impl GitWorktree {
     pub fn with_allow_hooks(mut self, allow_hooks: bool) -> Self {
         self.allow_hooks = allow_hooks;
         self
     }
+}
 
-    pub async fn prepare(
-        &self,
-        runner: &dyn CommandRunner,
-        event: &mut TaskPreparing,
-    ) -> Result<()> {
-        let Some(pull) = PullRequest::decode(&self.repository, event)? else {
-            return Ok(());
-        };
-        let _lock = self.lock.lock().await;
-        let git = Git {
-            runner,
-            allow_hooks: self.allow_hooks,
-        };
-        let mut repository =
-            Repository::inspect(&git, &self.checkout, &self.repository, &pull).await?;
-        let workspace = self
-            .resolve_workspace(&git, &repository, event, &pull)
-            .await?;
-        git.prepare_worktree(&mut repository, &workspace, &pull)
-            .await?;
-        let branch = BranchPlan::inspect(&git, &repository, &workspace, &pull).await?;
-        git.update_worktree(&workspace.path, &branch, &pull).await?;
-        event.task.session.git = Some(git.metadata(&workspace.path, &repository, &pull).await?);
-        event.task.session.cwd = workspace.path;
-        Ok(())
+impl Plugin for GitWorktree {
+    fn name(&self) -> &str {
+        "git.worktree"
     }
 
-    async fn resolve_workspace(
-        &self,
-        git: &Git<'_>,
-        repository: &Repository,
-        event: &TaskPreparing,
-        pull: &PullRequest,
-    ) -> Result<Workspace> {
-        if let Some(path) = Workspace::bound(git, repository, event).await? {
-            return Ok(Workspace {
-                path,
-                adopted: true,
-            });
-        }
-        git.command(
-            &repository.checkout,
-            "mkdir",
-            [OsStr::new("-p"), OsStr::new("--"), self.root.as_os_str()],
-        )
-        .await?
-        .text()?;
-        let root = PathBuf::from(git.command(&self.root, "pwd", ["-P"]).await?.text()?.trim());
-        ensure!(
-            root.is_absolute(),
-            "workspace root did not resolve to an absolute path"
-        );
-        let path = root.join(format!("pr-{}", pull.number));
-        ensure!(
-            path != repository.checkout,
-            "review workspace cannot be the configured checkout"
-        );
-        if let Some(tree) = repository.trees.get(&path) {
-            ensure!(
-                tree.locked.as_deref() == Some(pull.lock_reason.as_str()),
-                "workspace path is already owned by another task"
-            );
-        }
-        Ok(Workspace {
-            path,
-            adopted: false,
+    fn register(&self, ctx: &mut PluginContext) -> Result<()> {
+        ctx.require::<dyn CommandRunner>();
+        let allow_hooks = self.allow_hooks;
+        ctx.provide_with::<WorktreeService, _, _>(move |services| async move {
+            Ok(Arc::new(WorktreeService {
+                runner: services.get::<dyn CommandRunner>()?,
+                allow_hooks,
+                lock: Mutex::new(()),
+            }))
         })
     }
 }
 
-struct PullRequest {
-    number: u64,
-    subject: String,
-    head: String,
-    base: String,
-    head_ref: String,
-    review_branch: String,
-    lock_reason: String,
+/// A worktree allocation selected by trusted application configuration.
+/// Paths are absolute, and `existing_path` takes precedence when it identifies a registered worktree.
+/// The stable `owner` controls reuse; revisions are full commit SHAs, and `fetch_refs` are fully qualified refs fetched from `origin` when commits are missing.
+#[derive(Clone, Debug)]
+pub struct WorktreeRequest {
+    pub checkout: PathBuf,
+    pub path: PathBuf,
+    pub existing_path: Option<PathBuf>,
+    pub owner: String,
+    pub revision: String,
+    pub branch: String,
+    pub fallback_branch: String,
+    pub required_revisions: Vec<String>,
+    pub fetch_refs: Vec<String>,
+    pub expected_origin: String,
 }
 
-impl PullRequest {
-    fn decode(repository: &str, event: &TaskPreparing) -> Result<Option<Self>> {
-        let event = &event.job.event;
-        if event.source != format!("github:{repository}") {
-            return Ok(None);
+impl WorktreeRequest {
+    fn validated(&self) -> Result<Self> {
+        validate_path(&self.checkout)?;
+        validate_path(&self.path)?;
+        if let Some(path) = &self.existing_path {
+            validate_path(path)?;
         }
-        let context = &event.context;
         ensure!(
-            context["repository"] == repository,
-            "Git workspace repository mismatch"
+            !self.owner.is_empty()
+                && self.owner.trim() == self.owner
+                && !self.owner.chars().any(char::is_control),
+            "invalid worktree owner"
         );
-        let number = context["pr"]
-            .as_u64()
-            .filter(|number| *number > 0)
-            .context("missing pull request number")?;
         ensure!(
-            event.subject == format!("github:{repository}/pr/{number}"),
-            "Git workspace subject does not identify this pull request"
+            !self.expected_origin.is_empty() && !self.expected_origin.contains(['\0', '\n', '\r']),
+            "invalid expected Git origin"
         );
-        let head = revision(context["head_sha"].as_str())?;
-        let base = revision(context["base_sha"].as_str())?;
-        let head_ref = context["pull"]["head_ref"]
-            .as_str()
-            .filter(|name| !name.is_empty())
-            .context("missing pull request head branch")?
-            .to_owned();
-        Ok(Some(Self {
-            number,
-            subject: event.subject.clone(),
-            head,
-            base,
-            head_ref,
-            review_branch: format!("review/pr-{number}"),
-            lock_reason: format!("yandalf:{}", event.subject),
-        }))
+        let mut request = self.clone();
+        request.revision = revision(Some(&request.revision))?;
+        request.required_revisions = request
+            .required_revisions
+            .iter()
+            .map(|value| revision(Some(value)))
+            .collect::<Result<_>>()?;
+        Ok(request)
+    }
+
+    fn lock_reason(&self) -> String {
+        format!("yandalf:{}", self.owner)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PreparedWorktree {
+    pub cwd: PathBuf,
+    pub git: GitInfo,
+}
+
+pub struct WorktreeService {
+    runner: Arc<dyn CommandRunner>,
+    allow_hooks: bool,
+    lock: Mutex<()>,
+}
+
+impl WorktreeService {
+    fn git(&self) -> Git<'_> {
+        Git {
+            runner: self.runner.as_ref(),
+            allow_hooks: self.allow_hooks,
+        }
+    }
+
+    pub async fn origin(&self, checkout: &Path) -> Result<String> {
+        validate_path(checkout)?;
+        let git = self.git();
+        let checkout = git.top(checkout).await?;
+        git.text(&checkout, ["remote", "get-url", "origin"]).await
+    }
+
+    /// Requires an exact `expected_origin` match before any fetch or worktree mutation.
+    pub async fn prepare(&self, request: &WorktreeRequest) -> Result<PreparedWorktree> {
+        let request = request.validated()?;
+        let _lock = self.lock.lock().await;
+        let git = self.git();
+        let mut repository = Repository::inspect(&git, &request).await?;
+        let worktree = WorktreeLocation::resolve(&git, &repository, &request).await?;
+        git.prepare_worktree(&mut repository, &worktree, &request)
+            .await?;
+        let branch = BranchPlan::inspect(&git, &repository, &worktree, &request).await?;
+        git.update_worktree(&worktree.path, &branch, &request)
+            .await?;
+        Ok(PreparedWorktree {
+            git: git.metadata(&worktree.path, &repository, &request).await?,
+            cwd: worktree.path,
+        })
     }
 }
 
@@ -270,25 +239,32 @@ struct Repository {
 }
 
 impl Repository {
-    async fn inspect(
-        git: &Git<'_>,
-        checkout: &Path,
-        expected: &str,
-        pull: &PullRequest,
-    ) -> Result<Self> {
-        let checkout = git.top(checkout).await?;
-        let checked_branch = git
-            .output(&checkout, ["check-ref-format", "--branch", &pull.head_ref])
-            .await?;
-        ensure!(
-            checked_branch.success() && checked_branch.text()?.trim() == pull.head_ref,
-            "invalid pull request head branch"
-        );
+    async fn inspect(git: &Git<'_>, request: &WorktreeRequest) -> Result<Self> {
+        let checkout = git.top(&request.checkout).await?;
         let origin = git.text(&checkout, ["remote", "get-url", "origin"]).await?;
         ensure!(
-            origin_repository(&origin).as_deref() == Some(expected),
-            "configured checkout origin does not match GitHub repository"
+            origin == request.expected_origin,
+            "configured checkout origin does not match expected origin"
         );
+        for branch in [&request.branch, &request.fallback_branch] {
+            let checked = git
+                .output(&checkout, ["check-ref-format", "--branch", branch])
+                .await?;
+            ensure!(
+                checked.success() && checked.text()?.trim() == *branch,
+                "invalid worktree branch"
+            );
+        }
+        for reference in &request.fetch_refs {
+            ensure!(
+                reference.starts_with("refs/"),
+                "fetch ref must be fully qualified"
+            );
+            let checked = git
+                .output(&checkout, ["check-ref-format", reference])
+                .await?;
+            ensure!(checked.success(), "invalid fetch ref");
+        }
         Ok(Self {
             common: git.common(&checkout).await?,
             trees: git.worktrees(&checkout).await?,
@@ -298,21 +274,66 @@ impl Repository {
     }
 }
 
-struct Workspace {
+struct WorktreeLocation {
     path: PathBuf,
     adopted: bool,
 }
 
-impl Workspace {
+impl WorktreeLocation {
+    async fn resolve(
+        git: &Git<'_>,
+        repository: &Repository,
+        request: &WorktreeRequest,
+    ) -> Result<Self> {
+        if let Some(path) = Self::bound(git, repository, request.existing_path.as_deref()).await? {
+            return Ok(Self {
+                path,
+                adopted: true,
+            });
+        }
+        let parent = request
+            .path
+            .parent()
+            .context("worktree path has no parent")?;
+        let name = request
+            .path
+            .file_name()
+            .context("worktree path has no name")?;
+        git.command(
+            &repository.checkout,
+            "mkdir",
+            [OsStr::new("-p"), OsStr::new("--"), parent.as_os_str()],
+        )
+        .await?
+        .text()?;
+        let root = PathBuf::from(git.command(parent, "pwd", ["-P"]).await?.text()?.trim());
+        ensure!(
+            root.is_absolute(),
+            "worktree root did not resolve to an absolute path"
+        );
+        let path = root.join(name);
+        ensure!(
+            path != repository.checkout,
+            "worktree cannot be the configured checkout"
+        );
+        if let Some(tree) = repository.trees.get(&path) {
+            ensure!(
+                tree.locked.as_deref() == Some(request.lock_reason().as_str()),
+                "worktree path is already owned by another task"
+            );
+        }
+        Ok(Self {
+            path,
+            adopted: false,
+        })
+    }
+
     async fn bound(
         git: &Git<'_>,
         repository: &Repository,
-        event: &TaskPreparing,
+        existing: Option<&Path>,
     ) -> Result<Option<PathBuf>> {
-        if event.existing_session.is_none() {
-            return Ok(None);
-        }
-        let cwd = &event.task.session.cwd;
+        let Some(cwd) = existing else { return Ok(None) };
         let directory = git
             .command(
                 &repository.checkout,
@@ -322,28 +343,28 @@ impl Workspace {
             .await?;
         ensure!(
             matches!(directory.status, Some(0 | 1)),
-            "cannot inspect bound session directory"
+            "cannot inspect bound worktree directory"
         );
         if !directory.success() {
             let tree = repository
                 .trees
                 .get(cwd)
-                .context("missing bound session directory has no Git worktree registration")?;
+                .context("missing bound worktree directory has no Git worktree registration")?;
             ensure!(
                 !tree.primary && tree.prunable,
-                "bound session directory is not a confirmed missing worktree"
+                "bound worktree directory is not a confirmed missing worktree"
             );
             return Ok(None);
         }
         let path = git.top(cwd).await?;
         ensure!(
             git.common(&path).await? == repository.common,
-            "bound session belongs to a different repository"
+            "bound worktree belongs to a different repository"
         );
         let tree = repository
             .trees
             .get(&path)
-            .context("bound session is not a registered Git worktree")?;
+            .context("bound worktree is not a registered Git worktree")?;
         Ok((path != repository.checkout && !tree.primary).then_some(path))
     }
 }
@@ -358,15 +379,15 @@ impl BranchPlan {
     async fn inspect(
         git: &Git<'_>,
         repository: &Repository,
-        workspace: &Workspace,
-        pull: &PullRequest,
+        worktree: &WorktreeLocation,
+        request: &WorktreeRequest,
     ) -> Result<Self> {
         let tree = repository
             .trees
-            .get(&workspace.path)
+            .get(&worktree.path)
             .context("Git did not register the requested worktree")?;
-        let current = git.branch(&workspace.path).await?;
-        let owned = tree.locked.as_deref() == Some(pull.lock_reason.as_str());
+        let current = git.branch(&worktree.path).await?;
+        let owned = tree.locked.as_deref() == Some(request.lock_reason().as_str());
         if !owned {
             return Ok(Self {
                 current,
@@ -375,7 +396,7 @@ impl BranchPlan {
             });
         }
         let marked = if let Some(current) = &current {
-            git.branch_owner(&workspace.path, current, &pull.subject)
+            git.branch_owner(&worktree.path, current, &request.owner)
                 .await?
         } else {
             false
@@ -383,7 +404,7 @@ impl BranchPlan {
         ensure!(
             marked
                 || current.as_deref().is_none_or(|current| {
-                    current == pull.head_ref || current == pull.review_branch
+                    current == request.branch || current == request.fallback_branch
                 }),
             "worktree is attached to a different branch"
         );
@@ -400,44 +421,25 @@ impl BranchPlan {
                     || existing.starts_with(&format!("{reference}/"))
                     || reference.starts_with(&format!("{existing}/"))
             }) && !repository.trees.iter().any(|(other_path, tree)| {
-                other_path != &workspace.path && tree.branch.as_deref() == Some(reference.as_str())
+                other_path != &worktree.path && tree.branch.as_deref() == Some(reference.as_str())
             })
         };
         let target =
-            if current.as_deref() == Some(pull.head_ref.as_str()) || available(&pull.head_ref) {
-                pull.head_ref.clone()
+            if current.as_deref() == Some(request.branch.as_str()) || available(&request.branch) {
+                request.branch.clone()
             } else {
                 ensure!(
-                    current.as_deref() == Some(pull.review_branch.as_str())
-                        || available(&pull.review_branch),
-                    "pull request and review branch names are already in use"
+                    current.as_deref() == Some(request.fallback_branch.as_str())
+                        || available(&request.fallback_branch),
+                    "requested and fallback branch names are already in use"
                 );
-                pull.review_branch.clone()
+                request.fallback_branch.clone()
             };
         Ok(Self {
             current,
             target: Some(target),
             owned,
         })
-    }
-}
-
-impl Plugin for GitWorkspaces {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn register(&self, ctx: &mut PluginContext) -> Result<()> {
-        ctx.require::<dyn CommandRunner>();
-        let workspace = self.clone();
-        ctx.on::<TaskPreparing, _>(move |services, event| {
-            let workspace = workspace.clone();
-            Box::pin(async move {
-                let runner = services.get::<dyn CommandRunner>()?;
-                workspace.prepare(runner.as_ref(), event).await
-            })
-        });
-        Ok(())
     }
 }
 
@@ -528,7 +530,7 @@ impl Git<'_> {
         Ok(Some(output.text()?.trim().to_owned()))
     }
 
-    async fn branch_owner(&self, path: &Path, branch: &str, subject: &str) -> Result<bool> {
+    async fn branch_owner(&self, path: &Path, branch: &str, expected_owner: &str) -> Result<bool> {
         let owner = self
             .output(
                 path,
@@ -544,7 +546,7 @@ impl Git<'_> {
             return Ok(false);
         }
         ensure!(
-            owner.text()?.trim() == subject,
+            owner.text()?.trim() == expected_owner,
             "worktree branch is owned by another task"
         );
         Ok(true)
@@ -553,15 +555,14 @@ impl Git<'_> {
     async fn prepare_worktree(
         &self,
         repository: &mut Repository,
-        workspace: &Workspace,
-        pull: &PullRequest,
+        worktree: &WorktreeLocation,
+        request: &WorktreeRequest,
     ) -> Result<()> {
         let checkout = &repository.checkout;
-        let path = &workspace.path;
-        self.ensure_revisions(checkout, pull.number, &pull.head, &pull.base)
-            .await?;
+        let path = &worktree.path;
+        self.ensure_revisions(checkout, request).await?;
         if !repository.trees.contains_key(path) {
-            ensure!(!workspace.adopted, "bound worktree disappeared");
+            ensure!(!worktree.adopted, "bound worktree disappeared");
             let exists = self
                 .command(checkout, "test", [OsStr::new("-e"), path.as_os_str()])
                 .await?;
@@ -584,9 +585,9 @@ impl Git<'_> {
                     OsStr::new("--detach"),
                     OsStr::new("--lock"),
                     OsStr::new("--reason"),
-                    OsStr::new(&pull.lock_reason),
+                    OsStr::new(&request.lock_reason()),
                     path.as_os_str(),
-                    OsStr::new(&pull.head),
+                    OsStr::new(&request.revision),
                 ],
             )
             .await?;
@@ -596,17 +597,14 @@ impl Git<'_> {
             .trees
             .get(path)
             .context("Git did not register the requested worktree")?;
-        ensure!(
-            !tree.primary,
-            "review workspace cannot be the primary checkout"
-        );
+        ensure!(!tree.primary, "worktree cannot be the primary checkout");
         ensure!(
             self.common(path).await? == repository.common,
             "prepared worktree belongs to another repository"
         );
-        if !workspace.adopted {
+        if !worktree.adopted {
             ensure!(
-                tree.locked.as_deref() == Some(pull.lock_reason.as_str()),
+                tree.locked.as_deref() == Some(request.lock_reason().as_str()),
                 "Git did not preserve worktree ownership"
             );
         }
@@ -617,13 +615,13 @@ impl Git<'_> {
         &self,
         path: &Path,
         branch: &BranchPlan,
-        pull: &PullRequest,
+        request: &WorktreeRequest,
     ) -> Result<()> {
         let current_head = self.text(path, ["rev-parse", "HEAD"]).await?;
-        if current_head != pull.head {
+        if current_head != request.revision {
             ensure!(
                 branch.current.is_none() || branch.owned,
-                "refusing to move a non-review branch"
+                "refusing to move an unowned branch"
             );
             ensure!(
                 self.is_clean(path).await?,
@@ -638,13 +636,14 @@ impl Git<'_> {
                 [
                     "config",
                     &format!("branch.{name}.yandalf-subject"),
-                    &pull.subject,
+                    &request.owner,
                 ],
             )
             .await?;
         }
-        if current_head != pull.head {
-            self.text(path, ["reset", "--keep", &pull.head]).await?;
+        if current_head != request.revision {
+            self.text(path, ["reset", "--keep", &request.revision])
+                .await?;
             ensure!(
                 self.is_clean(path).await?,
                 "worktree changed while updating its revision"
@@ -680,11 +679,11 @@ impl Git<'_> {
         &self,
         path: &Path,
         repository: &Repository,
-        pull: &PullRequest,
+        request: &WorktreeRequest,
     ) -> Result<GitInfo> {
         let actual_head = self.text(path, ["rev-parse", "HEAD"]).await?;
         ensure!(
-            actual_head == pull.head,
+            actual_head == request.revision,
             "worktree revision changed while preparing the task"
         );
         Ok(GitInfo {
@@ -733,31 +732,26 @@ impl Git<'_> {
             .success())
     }
 
-    async fn ensure_revisions(
-        &self,
-        checkout: &Path,
-        number: u64,
-        head: &str,
-        base: &str,
-    ) -> Result<()> {
-        if !self.has_commit(checkout, head).await? {
-            self.text(
-                checkout,
-                [
-                    "fetch",
-                    "--no-tags",
-                    "origin",
-                    &format!("refs/pull/{number}/head"),
-                ],
-            )
-            .await?;
+    async fn ensure_revisions(&self, checkout: &Path, request: &WorktreeRequest) -> Result<()> {
+        let revisions: Vec<_> = std::iter::once(&request.revision)
+            .chain(request.required_revisions.iter())
+            .collect();
+        let mut missing = false;
+        for revision in &revisions {
+            missing |= !self.has_commit(checkout, revision).await?;
         }
-        for sha in [head, base] {
-            if !self.has_commit(checkout, sha).await? {
-                self.text(checkout, ["fetch", "--no-tags", "origin", sha])
+        if missing {
+            for reference in &request.fetch_refs {
+                self.text(checkout, ["fetch", "--no-tags", "origin", reference])
+                    .await?;
+            }
+        }
+        for revision in revisions {
+            if !self.has_commit(checkout, revision).await? {
+                self.text(checkout, ["fetch", "--no-tags", "origin", revision])
                     .await?;
                 ensure!(
-                    self.has_commit(checkout, sha).await?,
+                    self.has_commit(checkout, revision).await?,
                     "Git did not fetch the pinned revision"
                 );
             }
@@ -783,35 +777,17 @@ fn revision(value: Option<&str>) -> Result<String> {
     Ok(value.to_ascii_lowercase())
 }
 
-fn canonical_repository(repository: &str) -> Result<String> {
-    let Some((owner, name)) = repository.split_once('/') else {
-        bail!("GitHub repository must be owner/name");
-    };
+fn validate_path(path: &Path) -> Result<()> {
+    ensure!(path.is_absolute(), "Git worktree paths must be absolute");
     ensure!(
-        !owner.is_empty()
-            && !name.is_empty()
-            && !name.contains('/')
-            && owner
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-            && name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
-            && ![".", ".."].contains(&name),
-        "invalid GitHub repository"
+        !path.as_os_str().as_encoded_bytes().contains(&0),
+        "Git worktree paths must not contain NUL"
     );
-    Ok(repository.to_ascii_lowercase())
-}
-
-fn origin_repository(origin: &str) -> Option<String> {
-    let path = origin
-        .strip_prefix("https://github.com/")
-        .or_else(|| origin.strip_prefix("git@github.com:"))
-        .or_else(|| origin.strip_prefix("ssh://git@github.com/"))?;
-    canonical_repository(
-        path.trim_end_matches('/')
-            .strip_suffix(".git")
-            .unwrap_or(path.trim_end_matches('/')),
-    )
-    .ok()
+    ensure!(
+        !path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir)),
+        "Git worktree paths must not contain parent traversal"
+    );
+    Ok(())
 }

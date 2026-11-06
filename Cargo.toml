@@ -16,7 +16,7 @@ yandalf-codex = { path = "crates/yandalf-codex" }
 yandalf-sqlite = { path = "crates/yandalf-sqlite" }
 yandalf-github = { path = "crates/yandalf-github" }
 yandalf-channels = { path = "crates/yandalf-channels" }
-yandalf-git-workspaces = { path = "crates/yandalf-git-workspaces" }
+yandalf-git-worktree = { path = "crates/yandalf-git-worktree" }
 anyhow = "1.0"
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
@@ -60,9 +60,9 @@ yandalf-core.workspace = true
 yandalf-runtime.workspace = true
 yandalf-codex.workspace = true
 yandalf-sqlite = { workspace = true, optional = true }
-yandalf-github.workspace = true
+yandalf-github = { workspace = true, features = ["git-worktree"] }
 yandalf-channels.workspace = true
-yandalf-git-workspaces.workspace = true
+yandalf-git-worktree.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

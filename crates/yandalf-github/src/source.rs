@@ -30,6 +30,8 @@ pub struct Github {
     timing: Timing,
     instruction: Option<String>,
     on: Vec<ChangeKind>,
+    #[cfg(feature = "git-worktree")]
+    worktree: Option<crate::WorktreeConfig>,
 }
 
 impl Github {
@@ -43,6 +45,8 @@ impl Github {
             timing,
             instruction: None,
             on: ChangeKind::defaults(),
+            #[cfg(feature = "git-worktree")]
+            worktree: None,
         })
     }
 
@@ -63,6 +67,13 @@ impl Github {
             );
             self.instruction = Some(instruction.to_owned());
         }
+        Ok(self)
+    }
+
+    #[cfg(feature = "git-worktree")]
+    pub fn with_worktree(mut self, config: crate::WorktreeConfig) -> Result<Self> {
+        config.validate()?;
+        self.worktree = Some(config);
         Ok(self)
     }
 
@@ -327,6 +338,10 @@ impl Plugin for Github {
 
     fn register(&self, ctx: &mut PluginContext) -> Result<()> {
         ChannelPlugin::new(self.source(), self.clone()).register(ctx)?;
+        #[cfg(feature = "git-worktree")]
+        if let Some(worktree) = &self.worktree {
+            worktree.register(ctx, &self.repository, &self.source);
+        }
         let policy = Arc::new(GithubDecisions::new(&self.repository, self.on.clone())?);
         let source = self.source.clone();
         ctx.on::<TaskDeciding, _>(move |services, task| {

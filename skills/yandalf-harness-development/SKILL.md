@@ -21,7 +21,7 @@ Establish the inputs, logical subject identity, executor endpoint, persistent st
 
 - An ordinary plugin depends on `yandalf-core` and its own dependencies.
 - Add `yandalf-runtime` when using the durable task runner.
-- Add only the storage, executor and input crates the application uses. `yandalf-sqlite`, `yandalf-codex`, `yandalf-github`, `yandalf-channels` and `yandalf-git-workspaces` are separate providers.
+- Add only the storage, executor and input crates the application uses. `yandalf-sqlite`, `yandalf-codex`, `yandalf-github`, `yandalf-channels` and `yandalf-git-worktree` are separate plugins and services.
 - The root `yandalf` crate is a facade and a bundled service. Its TOML catalog selects bundled plugins; a consumer composes additional crates with `App::builder().plugin(...)` in Rust.
 
 Use a service trait for a capability with replaceable providers and typed events for interception or enrichment. Keep a small integration in one crate unless its contract, provider and consumers actually need independent ownership. Plugin authors may declare their own service traits and event types.

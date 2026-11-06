@@ -114,6 +114,8 @@ Completion observers have at-least-once semantics. When one fails, all can be re
 
 For a custom input, implement `Channel::run(inbox, stop)` and register it through ChannelPlugin, or register the same service dependency and task directly. Only acknowledge after `Inbox::accept` succeeds. Derive stable delivery IDs and subjects from the source entity.
 
+For Git worktrees, register `GitWorktree` and a CommandRunner provider. A task-preparation handler obtains `WorktreeService` and supplies a `WorktreeRequest` with trusted paths, ownership, validated revisions and fetch refs. The service knows no channel event schema or hosting-service conventions. The GitHub channel's optional `git-worktree` feature and `with_worktree(WorktreeConfig)` construct these requests from PR observations; other channels supply their own mapping. Keep PR numbers, GitHub refs and repository identity validation in the GitHub channel.
+
 Register multiple ChannelPlugin instances to run independent inputs in one application. They share the durable inbox; a busy executor must not block admission. Event IDs are scoped by source, while matching subjects share a session across sources. For blocking input such as stdin, bridge a dedicated reader thread into a bounded async channel; a blocked `tokio::io::stdin()` read can prevent Tokio runtime shutdown. The custom harness example uses two application mailboxes as transport boundaries.
 
 For an agent backend, implement Executor for session creation, configuration, turn execution, inspection and interruption. ExecutorProvider supplies a connection plus a future reporting closure. Match the selected checkout's interface and establish what the remote API can recover before claiming idempotent creation or submission.

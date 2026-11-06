@@ -1251,7 +1251,7 @@ dependencies = [
  "yandalf-channels",
  "yandalf-codex",
  "yandalf-core",
- "yandalf-git-workspaces",
+ "yandalf-git-worktree",
  "yandalf-github",
  "yandalf-runtime",
  "yandalf-sqlite",
@@ -1305,12 +1305,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "yandalf-git-workspaces"
+name = "yandalf-git-worktree"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "serde_json",
  "tempfile",
  "tokio",
  "yandalf-core",
@@ -1332,6 +1331,7 @@ dependencies = [
  "uuid",
  "yandalf-channels",
  "yandalf-core",
+ "yandalf-git-worktree",
  "yandalf-sqlite",
 ]
 

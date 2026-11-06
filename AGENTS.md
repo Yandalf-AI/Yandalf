@@ -10,7 +10,7 @@ Yandalf is a Rust Cargo workspace for composing agent harnesses from plugins. Th
 - `crates/yandalf-sqlite`: SQLite Store provider.
 - `crates/yandalf-github`: repository input and PR-change decisions.
 - `crates/yandalf-channels`: scheduled inputs.
-- `crates/yandalf-git-workspaces`: worktree preparation and the CommandRunner capability.
+- `crates/yandalf-git-worktree`: generic Git worktree preparation and the CommandRunner capability; no channel or PR semantics.
 - `src/app.rs`: configuration of plugins bundled with the service; `src/main.rs`: startup and shutdown.
 - `examples/custom_harness.rs`: a complete Rust composition with a custom result observer.
 - `tests/`: service integration tests with external fake servers; crate-local tests cover their own APIs.
@@ -49,7 +49,8 @@ cargo check -p yandalf --no-default-features --lib
 - Provider activation follows the dependency graph. Serial event handlers follow plugin registration order. Use `SerialEvent`/`on` for mutable preparation and `Notification`/`observe` for immutable notifications.
 - Runtime hooks prepare `TaskPreparing.task.input` and `.session`. `job.event` is a copy of the admitted observation and is not the runner's mutable execution plan.
 - Application shutdown must cancel and await owned tasks before asynchronous cleanup. Server clients close their connections; they do not spawn or terminate agent servers.
-- Keep GitHub policy in the GitHub plugin, filesystem preparation in workspace plugins, and SQL/locking in the storage adapter. The service binary only assembles its bundled plugin catalog. It has no review commands or domain workflows.
+- Keep GitHub policy in the GitHub channel, filesystem preparation in worktree plugins, and SQL/locking in the storage adapter. The service binary only assembles its bundled plugin catalog. It has no review commands or domain workflows.
+- The GitHub channel translates PR observations into worktree requests when configured. Git worktree preparation accepts explicit paths, revisions and refs; it must not interpret channel events or know hosting-service conventions.
 
 ## Durable execution contracts
 

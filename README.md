@@ -12,7 +12,7 @@ Plugins are ordinary Cargo dependencies. A custom plugin needs `yandalf-core`; s
 - `yandalf-sqlite`: the SQLite implementation of `Store`.
 - `yandalf-github`: repository polling and configurable PR-change decisions.
 - `yandalf-channels`: scheduled inputs.
-- `yandalf-git-workspaces`: Git worktree preparation and the replaceable `CommandRunner` capability.
+- `yandalf-git-worktree`: generic Git worktree preparation and the replaceable `CommandRunner` capability.
 
 ```rust
 use yandalf_core::plugin::App;
@@ -91,16 +91,17 @@ timeout_secs = 3600
 type = "local_commands"
 
 [[plugins]]
-type = "git_workspaces"
-repository = "example-org/example-repo"
-checkout = "/srv/repos/example"
-root = "/srv/workspaces/example"
+type = "git_worktree"
 
 [[plugins]]
 type = "github"
 repository = "example-org/example-repo"
 interval = "30s"
 text = "Используй $github-review. Проверь подготовленную ревизию PR и опубликуй краткое ревью по-русски."
+
+[plugins.worktree]
+checkout = "/srv/repos/example"
+root = "/srv/worktrees/example"
 ```
 
 Replace the sample endpoint and repository paths with those of your executor host. Paths resolve relative to the configuration file. The executable selects from its bundled plugins; an application with custom crates composes them through the Rust API. Build with `cargo build --release -p yandalf` and run `target/release/yandalf`. It has no command interface. SIGINT and SIGTERM stop the harness without terminating Codex.
@@ -113,15 +114,17 @@ One application can run multiple inputs concurrently: configure each GitHub repo
 
 ## GitHub review workflow
 
-The GitHub plugin watches the entire repository through outgoing `gh api` calls. Existing PRs establish a baseline without a retrospective review. Optional `on` selects `opened`, `revision`, `ready_for_review`, `reopened`, `edited`, `commented`, `reviewed` and `review_requested`; all are enabled by default. Draft PRs, the authenticated user's own activity and bot comments/reviews are skipped. CI status changes do not start turns. Superseded queued revisions are skipped when a newer observation is already stored.
+The GitHub channel watches the entire repository through outgoing `gh api` calls. Existing PRs establish a baseline without a retrospective review. Optional `on` selects `opened`, `revision`, `ready_for_review`, `reopened`, `edited`, `commented`, `reviewed` and `review_requested`; all are enabled by default. Draft PRs, the authenticated user's own activity and bot comments/reviews are skipped. CI status changes do not start turns. Superseded queued revisions are skipped when a newer observation is already stored.
 
 Closing or merging a tracked PR queues session archival after its current work finishes, without starting a model turn. This lifecycle action is independent of `on` and survives restarts. The session binding and worktree remain; reopening the PR restores and continues the same session.
 
 Observations and skip reasons survive restarts. Repository-wide comment feeds detect edits independently of PR timestamps. Stack membership supplies dependency context and never limits the watched PRs. Polling cannot reconstruct intermediate pushes between observations.
 
-`GitWorkspaces` uses the configured command provider before a session or turn is started. For a new PR it creates `root/pr-N`, checks out the observed head SHA using the PR's source branch name, and records ownership so interrupted preparation can safely reuse the directory. A conflicting local branch is preserved; the worktree uses `review/pr-N` instead. Existing owned review branches are renamed in place. Existing sessions retain their actual linked worktrees, including detached checkouts. Revision changes require a clean worktree and never alter the primary checkout or a foreign branch. `CommandRunner` must operate on the executor's host; `LocalCommands` is suitable when harness and executor share that host.
+With `[plugins.worktree]` configured, the GitHub channel registers a task-preparation handler. It validates the PR and repository, then constructs a `WorktreeRequest`: the pinned head, required base commit, PR fetch ref, source branch, `root/pr-N` path and `review/pr-N` fallback. These conventions belong to the channel. The `git-worktree` Cargo feature enables this integration; it is off by default in `yandalf-github` and enabled by the bundled service.
 
-Workspace preparation disables Git hooks by default. Set `allow_hooks = true` in a `git_workspaces` plugin entry, or call `GitWorkspaces::with_allow_hooks(true)`, to permit the checkout's configured hooks. Those hooks execute on the command provider's host and may come from the PR itself. This setting affects workspace preparation; the agent server controls commands executed by its tools.
+`GitWorktree` provides `WorktreeService` through the plugin registry. The service accepts explicit Git revisions, refs and paths; it does not inspect events or know about PRs or hosting services. Other channels or task handlers can use the same service. A single provider serves multiple configured GitHub channels. Existing sessions retain their actual linked worktrees, including detached checkouts. Revision changes require a clean worktree and never alter the primary checkout or a foreign branch. `CommandRunner` must operate on the executor's host; `LocalCommands` is suitable when harness and executor share that host.
+
+Worktree preparation disables Git hooks by default. Set `allow_hooks = true` in the `git_worktree` plugin entry, or call `GitWorktree::default().with_allow_hooks(true)`, to permit the checkout's configured hooks. Those hooks execute on the command provider's host and may come from the checked-out revision. This setting affects worktree preparation; the agent server controls commands executed by its tools.
 
 On Unix, SQLite creates new store directories with mode `0700` and database and lock files with mode `0600`. Opening an existing Yandalf database also restricts its database and journal files; unrelated parent directories keep their permissions.
 
